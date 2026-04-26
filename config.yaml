@@ -1,0 +1,57 @@
+name: "VoIP SIP Bridge"
+version: "2.0.0"
+slug: "voip_sip_bridge"
+description: >
+  Registers a VoIP SIP extension with Home Assistant.
+  Fires HA events on incoming calls and supports IVR audio responses.
+url: "https://github.com/yourusername/ha-voip-addon"
+arch:
+  - aarch64
+  - amd64
+startup: application
+map:
+  - share:rw
+ports:
+  5060/udp: 5060
+  8089/tcp: 8089
+ports_description:
+  5060/udp: "SIP signaling"
+  8089/tcp: "Add-on command API (HA to add-on)"
+options:
+  voip_username: ""
+  voip_password: ""
+  voip_domain: "callcentric.com"
+  voip_proxy: ""
+  voip_port: 5060
+  voip_transport: "udp"
+  voip_srtp: false
+  voip_tls_verify: true
+  voip_codecs:
+    - opus
+    - ulaw
+    - alaw
+  did_number: ""
+  ha_url: "http://homeassistant:8123"
+  ha_token: ""
+  auto_answer: true
+  play_greeting: true
+  greeting_text: "Hello. You have reached our home. Please hold."
+  record_calls: false
+schema:
+  voip_username: str
+  voip_password: str
+  voip_domain: str
+  voip_proxy: str?
+  voip_port: int
+  voip_transport: str
+  voip_srtp: bool
+  voip_tls_verify: bool
+  voip_codecs:
+    - str
+  did_number: str
+  ha_url: str
+  ha_token: str
+  auto_answer: bool
+  play_greeting: bool
+  greeting_text: str
+  record_calls: bool
