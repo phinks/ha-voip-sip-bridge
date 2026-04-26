@@ -116,7 +116,6 @@ transport={transport_name}
 context=incoming
 disallow=all
 {codec_lines}
-auth=voip-auth
 outbound_auth=voip-auth
 aors=voip-aor
 from_user={user}

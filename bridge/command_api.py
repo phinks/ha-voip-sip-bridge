@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 """
 command_api.py - REST API for HA to control active calls via Asterisk AMI.
 Compatible with Python 3.12+. Uses raw TCP AMI sockets.
@@ -20,6 +21,7 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 _channels = {}
+_ami_secret = ""
 _ami_lock = threading.Lock()
 _ami_sock = None
 
@@ -121,6 +123,32 @@ def ami_listener(host, port, secret):
         time.sleep(10)
 
 
+
+@app.route("/cmd", methods=["GET"])
+def run_cmd():
+    import socket as _s, time as _t
+    cmd = request.args.get("c", "core show version")
+    s = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+    try:
+        s.connect(("127.0.0.1", 5038))
+        s.recv(1024)
+        s.sendall(("Action: Login\r\nUsername: bridge\r\nSecret: " + os.environ.get("AMI_SECRET", "") + "\r\n\r\n").encode())
+        _t.sleep(0.3)
+        s.recv(4096)
+        s.sendall(f"Action: Command\r\nCommand: {cmd}\r\n\r\n".encode())
+        _t.sleep(1)
+        s.settimeout(2)
+        result = b""
+        try:
+            while True:
+                chunk = s.recv(4096)
+                if not chunk: break
+                result += chunk
+        except: pass
+        return result.decode(errors="replace"), 200, {"Content-Type": "text/plain"}
+    finally:
+        s.close()
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--ami-host',   default='127.0.0.1')
@@ -128,6 +156,8 @@ def main():
     parser.add_argument('--ami-secret', required=True)
     parser.add_argument('--api-port',   type=int, default=8089)
     args = parser.parse_args()
+    global _ami_secret
+    _ami_secret = args.ami_secret
 
     t = threading.Thread(
         target=ami_listener,
