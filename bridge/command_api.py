@@ -149,6 +149,15 @@ def run_cmd():
     finally:
         s.close()
 
+@app.route("/log", methods=["GET"])
+def get_log():
+    path = request.args.get("f", "/tmp/debug.log")
+    try:
+        return open(path).read(), 200, {"Content-Type": "text/plain"}
+    except Exception as e:
+        return str(e), 404
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--ami-host',   default='127.0.0.1')
@@ -173,3 +182,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

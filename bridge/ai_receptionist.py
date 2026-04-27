@@ -21,6 +21,14 @@ import subprocess
 import tempfile
 import requests
 import datetime
+
+def call_log(unique_id, role, text):
+    """Append to conversation log file."""
+    try:
+        with open(f"/share/voip/conversation_{unique_id}.log", "a") as f:
+            f.write(f"[{datetime.datetime.now().strftime("%H:%M:%S")}] {role}: {text}\n")
+    except Exception:
+        pass
 import re
 
 # ---------------------------------------------------------------------------
@@ -94,118 +102,107 @@ class AGI:
 # TTS - Piper
 # ---------------------------------------------------------------------------
 
-def tts_speak(agi, text, tmp_dir='/tmp/voip_tts'):
-    """Convert text to speech using piper and play it."""
-    os.makedirs(tmp_dir, exist_ok=True)
-    wav_file = os.path.join(tmp_dir, f'tts_{int(time.time()*1000)}.wav')
-    asterisk_file = wav_file.replace('.wav', '')  # Asterisk needs no extension
-
-    voice_model = '/share/voip/piper/en_US-lessac-medium.onnx'
-    piper_bin = '/usr/local/bin/piper'
-
-    if not os.path.exists(voice_model) or not os.path.exists(piper_bin):
-        # Fallback to espeak
-        agi.verbose(f'Piper not available, using espeak for: {text[:50]}')
-        espeak_wav = wav_file.replace('.wav', '_espeak.wav')
-        subprocess.run([
-            'espeak', '-a', '150', '-s', '130', '-v', 'en', text,
-            '--stdout'
-        ], stdout=open(espeak_wav, 'wb'), stderr=subprocess.DEVNULL)
-        # Convert to 8kHz mono
-        subprocess.run([
-            'sox', espeak_wav, '-r', '8000', '-c', '1', wav_file
-        ], stderr=subprocess.DEVNULL)
-        os.unlink(espeak_wav)
-    else:
-        # Use piper
-        proc = subprocess.Popen(
-            [piper_bin, '--model', voice_model, '--output_file', wav_file],
-            stdin=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
-        )
-        proc.communicate(input=text.encode())
-        # Convert to 8kHz mono for Asterisk
-        converted = wav_file.replace('.wav', '_8k.wav')
-        subprocess.run([
-            'sox', wav_file, '-r', '8000', '-c', '1', converted
-        ], stderr=subprocess.DEVNULL)
-        os.unlink(wav_file)
-        os.rename(converted, wav_file)
-
-    if os.path.exists(wav_file):
-        agi.playback(asterisk_file)
-        try:
-            os.unlink(wav_file)
-        except Exception:
-            pass
-    else:
-        agi.verbose('TTS file generation failed')
-
-
-# ---------------------------------------------------------------------------
-# STT - Whisper
-# ---------------------------------------------------------------------------
-
-def stt_transcribe(wav_file):
-    """Transcribe audio using Whisper."""
-    try:
-        import whisper
-        model = whisper.load_model('tiny')
-        result = model.transcribe(wav_file, language='en', fp16=False)
-        return result.get('text', '').strip()
-    except ImportError:
-        # Fallback: try whisper CLI
-        try:
-            result = subprocess.run(
-                ['whisper', wav_file, '--model', 'tiny', '--language', 'en',
-                 '--output_format', 'txt', '--output_dir', '/tmp'],
-                capture_output=True, text=True, timeout=30
-            )
-            txt_file = wav_file.replace('.wav', '.txt')
-            if os.path.exists(txt_file):
-                text = open(txt_file).read().strip()
-                os.unlink(txt_file)
-                return text
-        except Exception as e:
-            return ''
-    except Exception as e:
-        return ''
-
-
-# ---------------------------------------------------------------------------
-# Claude API
-# ---------------------------------------------------------------------------
-
 def claude_respond(messages, system_prompt, api_key, max_tokens=300):
     """Call Claude API and return response text."""
     try:
         resp = requests.post(
-            'https://api.anthropic.com/v1/messages',
+            "https://api.anthropic.com/v1/messages",
             headers={
-                'x-api-key': api_key,
-                'anthropic-version': '2023-06-01',
-                'content-type': 'application/json',
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
             },
             json={
-                'model': 'claude-sonnet-4-20250514',
-                'max_tokens': max_tokens,
-                'system': system_prompt,
-                'messages': messages,
+                "model": "claude-sonnet-4-5",
+                "max_tokens": max_tokens,
+                "system": system_prompt,
+                "messages": messages,
             },
             timeout=15,
         )
+        open("/tmp/debug.log", "a").write(f"Claude status: {resp.status_code}, body: {resp.text[:300]}\n")
         data = resp.json()
-        for block in data.get('content', []):
-            if block.get('type') == 'text':
-                return block['text'].strip()
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                return block["text"].strip()
     except Exception as e:
+        open("/tmp/debug.log", "a").write(f"Claude exception: {e}\n")
         return None
     return None
 
 
-# ---------------------------------------------------------------------------
-# HA notification
-# ---------------------------------------------------------------------------
+def tts_speak(agi, text, ha_url, ha_token, tmp_dir="/tmp/voip_tts"):
+    """Convert text to speech using HA Cloud TTS."""
+    import os
+    os.makedirs(tmp_dir, exist_ok=True)
+    wav_file = os.path.join(tmp_dir, f"tts_{int(time.time()*1000)}.wav")
+    asterisk_file = wav_file.replace(".wav", "")
+    try:
+        resp = requests.post(
+            f"{ha_url.rstrip("/")}/api/tts_get_url",
+            headers={
+                "Authorization": f"Bearer {ha_token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "platform": "cloud",
+                "message": text,
+                "language": "en-US",
+                "options": {"gender": "female"},
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            audio_url = resp.json().get("url", "")
+            if audio_url:
+                # Download the audio
+                audio_resp = requests.get(audio_url, timeout=10)
+                mp3_file = wav_file.replace(".wav", ".mp3")
+                with open(mp3_file, "wb") as f:
+                    f.write(audio_resp.content)
+                # Convert to 8kHz mono WAV for Asterisk
+                subprocess.run(["ffmpeg", "-i", mp3_file, "-ar", "8000", "-ac", "1", wav_file, "-y"], stderr=subprocess.DEVNULL)
+                os.unlink(mp3_file)
+    except Exception as e:
+        agi.verbose(f"HA TTS failed: {e}")
+    # Fallback to espeak
+    if not os.path.exists(wav_file):
+        espeak_wav = wav_file.replace(".wav", "_espeak.wav")
+        subprocess.run([
+            "espeak", "-a", "150", "-s", "130", "-v", "en", text,
+            "--stdout"
+        ], stdout=open(espeak_wav, "wb"), stderr=subprocess.DEVNULL)
+        subprocess.run([
+            "sox", espeak_wav, "-r", "8000", "-c", "1", wav_file
+        ], stderr=subprocess.DEVNULL)
+        try: os.unlink(espeak_wav)
+        except: pass
+    if os.path.exists(wav_file):
+        agi.playback(asterisk_file)
+        try: os.unlink(wav_file)
+        except: pass
+
+
+def stt_transcribe(wav_file, groq_api_key):
+    """Transcribe audio using Groq Whisper API."""
+    try:
+        with open(wav_file, "rb") as f:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {groq_api_key}"},
+                files={"file": ("audio.wav", f, "audio/wav")},
+                data={"model": "whisper-large-v3-turbo", "language": "en"},
+                timeout=15,
+            )
+        if resp.status_code == 200:
+            return resp.json().get("text", "").strip()
+        open("/tmp/debug.log", "a").write(f"Groq status: {resp.status_code}, body: {resp.text[:200]}\n")
+        return ""
+    except Exception as e:
+        return ""
+    except Exception as e:
+        open("/tmp/debug.log", "a").write(f"Groq exception: {e}\n")
+        return ""
 
 def ha_notify(ha_url, ha_token, title, message, critical=False):
     """Fire a HA notification."""
@@ -297,7 +294,8 @@ def main():
     # Config from environment
     ha_url      = os.environ.get('HA_URL', 'http://homeassistant:8123')
     ha_token    = os.environ.get('HA_TOKEN', '')
-    api_key     = os.environ.get('ANTHROPIC_API_KEY', '')
+    api_key     = os.environ.get("ANTHROPIC_API_KEY", "")
+    groq_key    = os.environ.get("GROQ_API_KEY", "")
     owner_name  = os.environ.get('OWNER_NAME', 'the owner')
     availability = os.environ.get('AVAILABILITY_INFO', 'often unavailable')
 
@@ -369,7 +367,7 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
         greeting = f"Hello, you've reached {owner_name}'s home. How can I help you today?"
 
     agi.verbose(f'Greeting: {greeting}')
-    tts_speak(agi, greeting)
+    tts_speak(agi, greeting, ha_url, ha_token)
     transcript.append({'role': 'assistant', 'content': greeting})
     conversation.append({'role': 'assistant', 'content': greeting})
 
@@ -381,9 +379,11 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
 
     for turn in range(max_turns):
         # Record caller speech
-        rec_file = f'/tmp/voip_rec_{unique_id}_{turn}'
+        rec_file = f"/var/spool/asterisk/recording/voip_rec_{unique_id}_{turn}"
         agi.verbose(f'Recording turn {turn}...')
-        result = agi.record_file(rec_file, fmt='wav', timeout=8000, silence=2)
+        result = agi.record_file(rec_file, fmt="wav", timeout=8000, silence=2)
+        open("/tmp/debug.log", "a").write(f"Turn {turn}: result={result}, file={rec_file}.wav, exists={os.path.exists(rec_file + ".wav")}\n")
+        agi.verbose(f"Record result: {result}, checking: {rec_file}.wav")
 
         wav_path = f'{rec_file}.wav'
         if not os.path.exists(wav_path):
@@ -392,12 +392,19 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
         # Check if file has meaningful audio (> 1KB)
         if os.path.getsize(wav_path) < 1024:
             os.unlink(wav_path)
-            tts_speak(agi, "I'm sorry, I didn't catch that. Could you please repeat?")
+            tts_speak(agi, "I'm sorry, I didn't catch that. Could you please repeat?", ha_url, ha_token)
             continue
 
+        # Convert to 16kHz for better STT accuracy
+        wav_16k = wav_path.replace(".wav", "_16k.wav")
+        subprocess.run(["ffmpeg", "-i", wav_path, "-ar", "16000", "-ac", "1", wav_16k, "-y"], stderr=subprocess.DEVNULL)
+        if os.path.exists(wav_16k):
+            os.unlink(wav_path)
+            wav_path = wav_16k
         # Transcribe
         agi.verbose('Transcribing...')
-        caller_text = stt_transcribe(wav_path)
+        caller_text = stt_transcribe(wav_path, groq_key)
+        open("/tmp/debug.log", "a").write(f"STT result: {repr(caller_text)}\n")
 
         try:
             os.unlink(wav_path)
@@ -405,10 +412,11 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
             pass
 
         if not caller_text:
-            tts_speak(agi, "I'm sorry, I had trouble hearing you. Could you repeat that?")
+            tts_speak(agi, "I'm sorry, I had trouble hearing you. Could you repeat that?", ha_url, ha_token)
             continue
 
-        agi.verbose(f'Caller said: {caller_text}')
+        agi.verbose(f"Caller said: {caller_text}")
+        call_log(unique_id, "CALLER", caller_text)
         transcript.append({'role': 'user', 'content': caller_text})
         conversation.append({'role': 'user', 'content': caller_text})
 
@@ -432,15 +440,16 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
                         break
                     except Exception:
                         continue
-                tts_speak(agi, spoken or "Thank you for calling. Goodbye!")
+                tts_speak(agi, spoken or "Thank you for calling. Goodbye!", ha_url, ha_token)
                 transcript.append({'role': 'assistant', 'content': spoken})
             break
 
         # Get Claude response
         response = claude_respond(conversation, system_prompt, api_key, max_tokens=200)
+        open("/tmp/debug.log", "a").write(f"Claude response: {repr(response)}\n")
 
         if not response:
-            tts_speak(agi, "I'm sorry, I'm having some trouble. Please try calling back.")
+            tts_speak(agi, "I'm sorry, I'm having some trouble. Please try calling back.", ha_url, ha_token)
             break
 
         # Check if response contains JSON summary (end of conversation)
@@ -454,8 +463,9 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
             except Exception:
                 continue
 
-        agi.verbose(f'Response: {spoken_response}')
-        tts_speak(agi, spoken_response)
+        agi.verbose(f"Response: {spoken_response}")
+        call_log(unique_id, "AI", spoken_response)
+        tts_speak(agi, spoken_response, ha_url, ha_token)
         transcript.append({'role': 'assistant', 'content': spoken_response})
         conversation.append({'role': 'assistant', 'content': response})
 

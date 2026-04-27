@@ -31,6 +31,11 @@ VOIP_SRTP=$(get_opt_bool voip_srtp)
 VOIP_DID=$(get_opt did_number)
 HA_URL=$(get_opt ha_url)
 HA_TOKEN=$(get_opt ha_token)
+ANTHROPIC_API_KEY=$(get_opt anthropic_api_key)
+GROQ_API_KEY=$(get_opt groq_api_key)
+OWNER_NAME=$(get_opt owner_name)
+AVAILABILITY_INFO=$(get_opt availability_info)
+AI_RECEPTIONIST=$(get_opt_bool ai_receptionist)
 AUTO_ANSWER=$(get_opt_bool auto_answer)
 PLAY_GREETING=$(get_opt_bool play_greeting)
 GREETING_TEXT=$(get_opt greeting_text)
@@ -57,6 +62,7 @@ echo "Transport: $VOIP_TRANSPORT:$VOIP_PORT | Codecs: $VOIP_CODECS"
 export VOIP_USER VOIP_PASS VOIP_DOMAIN VOIP_PROXY VOIP_PORT VOIP_TRANSPORT
 export VOIP_ENCRYPTION VOIP_CODECS VOIP_DID HA_URL HA_TOKEN
 export AUTO_ANSWER PLAY_GREETING GREETING_TEXT RECORD_CALLS AMI_SECRET
+export ANTHROPIC_API_KEY GROQ_API_KEY OWNER_NAME AVAILABILITY_INFO AI_RECEPTIONIST
 
 # ---------------------------------------------------------------------------
 # Generate dynamic Asterisk configs into /tmp/voip/

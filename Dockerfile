@@ -7,6 +7,7 @@ RUN apk add --no-cache \
     asterisk-srtp \
     asterisk-sounds-en \
     asterisk-curl \
+    ffmpeg \
     espeak \
     python3 \
     py3-pip \
@@ -41,7 +42,8 @@ RUN touch /tmp/voip/pjsip_dynamic.conf \
 
 # Install AGI handler
 COPY bridge/agi_handler.py /var/lib/asterisk/agi-bin/agi_handler.py
-RUN chmod +x /var/lib/asterisk/agi-bin/agi_handler.py
+COPY bridge/ai_receptionist.py /var/lib/asterisk/agi-bin/ai_receptionist.py
+RUN chmod +x /var/lib/asterisk/agi-bin/agi_handler.py /var/lib/asterisk/agi-bin/ai_receptionist.py
 
 COPY run.sh /run.sh
 RUN chmod +x /run.sh

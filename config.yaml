@@ -1,5 +1,5 @@
 name: "VoIP SIP Bridge"
-version: "3.0.5"
+version: "1.0.0"
 slug: "voip_sip_bridge"
 description: >
   Registers a VoIP SIP extension with Home Assistant.
@@ -37,6 +37,11 @@ options:
   play_greeting: true
   greeting_text: "Hello. You have reached our home. Please hold."
   record_calls: false
+  anthropic_api_key: ""
+  groq_api_key: ""
+  owner_name: ""
+  availability_info: "usually unavailable, please leave a message"
+  ai_receptionist: false
 schema:
   voip_username: str
   voip_password: str
@@ -55,3 +60,8 @@ schema:
   play_greeting: bool
   greeting_text: str
   record_calls: bool
+  anthropic_api_key: str
+  groq_api_key: str
+  owner_name: str
+  availability_info: str
+  ai_receptionist: bool
