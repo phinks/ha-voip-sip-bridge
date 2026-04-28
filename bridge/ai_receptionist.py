@@ -323,11 +323,9 @@ def main():
 
     # Fire incoming event
     ha_event(ha_url, ha_token, 'voip_call_incoming', call_info)
-
-    # Answer call
-    agi.answer()
-    time.sleep(0.5)
-
+    # Play immediate greeting while Claude prepares
+    if os.path.exists("/share/voip/greeting"):
+        agi.playback("/share/voip/greeting")
     # Build system prompt
     system_prompt = f"""You are an AI receptionist answering calls for {owner_name}.
 

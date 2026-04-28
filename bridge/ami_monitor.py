@@ -47,6 +47,18 @@ async def handle_event(event, session, ha_url, ha_token):
     async def send(ha_name, data):
         await ha_event(session, ha_url, ha_token, ha_name, data)
 
+        # Log all calls to file
+        if name in ("Newchannel", "Hangup", "DialBegin", "DialEnd"):
+            import datetime
+            caller = event.get("CallerIDNum", "unknown")
+            caller_name = event.get("CallerIDName", "")
+            cause = event.get("Cause-txt", "")
+            msg = f"{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")} {name}: {caller} ({caller_name}) {cause}"
+            try:
+                log.info(msg)
+                open("/share/voip/call_log.txt", "a").write(msg + "\n")
+            except Exception:
+                pass
     if name == 'Newchannel':
         await send('voip_channel_created', {
             'channel':     event.get('Channel', ''),

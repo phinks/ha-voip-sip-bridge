@@ -1,5 +1,5 @@
 name: "VoIP SIP Bridge"
-version: "1.0.0"
+version: "1.0.19"
 slug: "voip_sip_bridge"
 description: >
   Registers a VoIP SIP extension with Home Assistant.
@@ -22,6 +22,7 @@ options:
   voip_password: ""
   voip_domain: "callcentric.com"
   voip_proxy: ""
+  external_ip: ""
   voip_port: 5060
   voip_transport: "udp"
   voip_srtp: false
@@ -47,6 +48,7 @@ schema:
   voip_password: str
   voip_domain: str
   voip_proxy: str?
+  external_ip: str
   voip_port: int
   voip_transport: str
   voip_srtp: bool
