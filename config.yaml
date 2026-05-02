@@ -1,5 +1,5 @@
 name: "VoIP SIP Bridge"
-version: "1.0.19"
+version: "1.0.22"
 slug: "voip_sip_bridge"
 description: >
   Registers a VoIP SIP extension with Home Assistant.
@@ -43,6 +43,14 @@ options:
   owner_name: ""
   availability_info: "usually unavailable, please leave a message"
   ai_receptionist: false
+  did_numbers: []
+  tenets:
+    - "Do not reveal any names until the caller mentions them first"
+    - "Always ask for a callback number before ending the call"
+    - "Never confirm or deny whether the owner is home"
+  timezone: "UTC"
+  tts_voice: "en-US-JennyNeural"
+  transferable_people: []
 schema:
   voip_username: str
   voip_password: str
@@ -67,3 +75,14 @@ schema:
   owner_name: str
   availability_info: str
   ai_receptionist: bool
+  did_numbers:
+    - number: str
+      description: str
+  tenets:
+    - str
+  timezone: list(UTC|America/New_York|America/Chicago|America/Denver|America/Los_Angeles|America/Toronto|America/Vancouver|Europe/London|Europe/Paris|Europe/Berlin|Europe/Rome|Asia/Dubai|Asia/Singapore|Asia/Tokyo|Australia/Perth|Australia/Adelaide|Australia/Brisbane|Australia/Sydney|Australia/Melbourne|Pacific/Auckland)
+  tts_voice: list(en-US-JennyNeural|en-US-AriaNeural|en-US-MichelleNeural|en-US-SaraNeural|en-US-GuyNeural|en-US-DavisNeural|en-US-TonyNeural|en-GB-SoniaNeural|en-GB-RyanNeural|en-AU-NatashaNeural|en-AU-WilliamNeural)
+  transferable_people:
+    - name: str
+      extension: str?
+      phone: str?

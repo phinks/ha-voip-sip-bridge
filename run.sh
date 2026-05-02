@@ -36,6 +36,11 @@ GROQ_API_KEY=$(get_opt groq_api_key)
 OWNER_NAME=$(get_opt owner_name)
 AVAILABILITY_INFO=$(get_opt availability_info)
 AI_RECEPTIONIST=$(get_opt_bool ai_receptionist)
+DID_NUMBERS=$(python3 -c "import json; d=json.load(open('$OPTIONS')); print(json.dumps(d.get('did_numbers', [])))")
+TENETS=$(python3 -c "import json; d=json.load(open('$OPTIONS')); print(json.dumps(d.get('tenets', [])))")
+TIMEZONE=$(get_opt timezone)
+TTS_VOICE=$(get_opt tts_voice)
+TRANSFERABLE_PEOPLE=$(python3 -c "import json; d=json.load(open('$OPTIONS')); print(json.dumps(d.get('transferable_people', [])))")
 AUTO_ANSWER=$(get_opt_bool auto_answer)
 PLAY_GREETING=$(get_opt_bool play_greeting)
 GREETING_TEXT=$(get_opt greeting_text)
@@ -66,7 +71,7 @@ export VOIP_USER VOIP_PASS VOIP_DOMAIN VOIP_PROXY VOIP_PORT VOIP_TRANSPORT
 export VOIP_ENCRYPTION VOIP_CODECS VOIP_DID HA_URL HA_TOKEN
 export AUTO_ANSWER PLAY_GREETING GREETING_TEXT RECORD_CALLS AMI_SECRET
 export EXTERNAL_IP
-export ANTHROPIC_API_KEY GROQ_API_KEY OWNER_NAME AVAILABILITY_INFO AI_RECEPTIONIST
+export ANTHROPIC_API_KEY GROQ_API_KEY OWNER_NAME AVAILABILITY_INFO AI_RECEPTIONIST DID_NUMBERS TENETS TIMEZONE TTS_VOICE TRANSFERABLE_PEOPLE
 
 # ---------------------------------------------------------------------------
 # Generate dynamic Asterisk configs into /tmp/voip/

@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import requests
 import datetime
+from zoneinfo import ZoneInfo
 
 def call_log(unique_id, role, text):
     """Append to conversation log file."""
@@ -131,7 +132,7 @@ def claude_respond(messages, system_prompt, api_key, max_tokens=300):
     return None
 
 
-def tts_speak(agi, text, ha_url, ha_token, tmp_dir="/tmp/voip_tts"):
+def tts_speak(agi, text, ha_url, ha_token, voice="en-US-JennyNeural", tmp_dir="/tmp/voip_tts"):
     """Convert text to speech using HA Cloud TTS."""
     import os
     os.makedirs(tmp_dir, exist_ok=True)
@@ -148,7 +149,7 @@ def tts_speak(agi, text, ha_url, ha_token, tmp_dir="/tmp/voip_tts"):
                 "platform": "cloud",
                 "message": text,
                 "language": "en-US",
-                "options": {"gender": "female"},
+                "options": {"voice": voice},
             },
             timeout=10,
         )
@@ -204,21 +205,36 @@ def stt_transcribe(wav_file, groq_api_key):
         open("/tmp/debug.log", "a").write(f"Groq exception: {e}\n")
         return ""
 
-def ha_notify(ha_url, ha_token, title, message, critical=False):
-    """Fire a HA notification."""
+def ha_persistent_notification(ha_url, ha_token, title, message, notification_id):
+    """Create a persistent notification in HA (visible in the notifications panel)."""
     try:
-        payload = {
-            'title': title,
-            'message': message,
-        }
+        requests.post(
+            f'{ha_url.rstrip("/")}/api/services/persistent_notification/create',
+            headers={
+                'Authorization': f'Bearer {ha_token}',
+                'Content-Type': 'application/json',
+            },
+            json={
+                'title': title,
+                'message': message,
+                'notification_id': notification_id,
+            },
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def ha_notify(ha_url, ha_token, title, message, critical=False):
+    """Fire a HA mobile notification."""
+    try:
+        data = {'url': '/'}
         if critical:
-            payload['data'] = {
-                'push': {
-                    'sound': {
-                        'name': 'default',
-                        'critical': 1,
-                        'volume': 1.0,
-                    }
+            data['push'] = {
+                'sound': {
+                    'name': 'default',
+                    'critical': 1,
+                    'volume': 1.0,
                 }
             }
         requests.post(
@@ -227,7 +243,11 @@ def ha_notify(ha_url, ha_token, title, message, critical=False):
                 'Authorization': f'Bearer {ha_token}',
                 'Content-Type': 'application/json',
             },
-            json=payload,
+            json={
+                'title': title,
+                'message': message,
+                'data': data,
+            },
             timeout=5,
         )
     except Exception:
@@ -248,6 +268,27 @@ def ha_event(ha_url, ha_token, event_name, data):
         )
     except Exception:
         pass
+
+
+def auto_capture_did(extension):
+    """Record an unseen DID to /share/voip/known_dids.json. Returns True if it was new."""
+    if not extension:
+        return False
+    did_file = '/share/voip/known_dids.json'
+    try:
+        os.makedirs('/share/voip', exist_ok=True)
+        known = {}
+        if os.path.exists(did_file):
+            with open(did_file) as f:
+                known = json.load(f)
+        if extension in known:
+            return False
+        known[extension] = {'first_seen': datetime.datetime.now().isoformat()}
+        with open(did_file, 'w') as f:
+            json.dump(known, f, indent=2)
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +331,8 @@ def main():
         caller_id = sys.argv[1] or caller_id
     if len(sys.argv) >= 3:
         caller_name = sys.argv[2] or caller_name
+    if len(sys.argv) >= 5:
+        extension = sys.argv[4] or extension
 
     # Config from environment
     ha_url      = os.environ.get('HA_URL', 'http://homeassistant:8123')
@@ -298,6 +341,51 @@ def main():
     groq_key    = os.environ.get("GROQ_API_KEY", "")
     owner_name  = os.environ.get('OWNER_NAME', 'the owner')
     availability = os.environ.get('AVAILABILITY_INFO', 'often unavailable')
+    tts_voice   = os.environ.get('TTS_VOICE', 'en-US-JennyNeural')
+    tz          = ZoneInfo(os.environ.get('TIMEZONE', 'UTC') or 'UTC')
+
+    tenets = []
+    try:
+        tenets = json.loads(os.environ.get('TENETS', '[]'))
+    except Exception:
+        pass
+
+    did_numbers = {}
+    try:
+        for entry in json.loads(os.environ.get('DID_NUMBERS', '[]')):
+            num = entry.get('number', '').strip().lstrip('+')
+            if num:
+                did_numbers[num] = entry.get('description', '').strip()
+    except Exception:
+        pass
+
+    # Parse transferable people: [{"name": "Paul", "extension": "PJSIP/paul", "phone": "SIP/voip/+1..."}]
+    transferable = {}  # lowercase name -> {"name": str, "dial": str}
+    try:
+        people_raw = json.loads(os.environ.get('TRANSFERABLE_PEOPLE', '[]'))
+        for p in people_raw:
+            name = p.get('name', '').strip()
+            if not name:
+                continue
+            parts = [p.get('extension', '').strip(), p.get('phone', '').strip()]
+            dial = '&'.join(x for x in parts if x)
+            transferable[name.lower()] = {'name': name, 'dial': dial}
+    except Exception:
+        pass
+
+    # Auto-capture unseen DIDs
+    if extension and extension not in did_numbers:
+        if auto_capture_did(extension):
+            ha_persistent_notification(
+                ha_url, ha_token,
+                f'New DID seen: {extension}',
+                (
+                    f'A call was received on **{extension}**, which has no label yet.\n\n'
+                    f'To label it, add it to the **did_numbers** list in the VoIP SIP Bridge configuration:\n\n'
+                    f'```\nnumber: "{extension}"\ndescription: "My description"\n```'
+                ),
+                notification_id=f'voip_new_did_{extension}',
+            )
 
     # Load known contacts
     known_contacts = {}
@@ -318,6 +406,7 @@ def main():
         'channel':     channel,
         'unique_id':   unique_id,
         'extension':   extension,
+        'did':         extension,
         'known_caller': bool(known_caller_name),
     }
 
@@ -327,25 +416,49 @@ def main():
     if os.path.exists("/share/voip/greeting"):
         agi.playback("/share/voip/greeting")
     # Build system prompt
+    transfer_section = ""
+    if transferable:
+        names = ', '.join(p['name'] for p in transferable.values())
+        transfer_section = f"""
+People who can receive transferred calls: {names}
+- If the caller asks to speak with one of these people, confirm the name and offer to transfer them.
+- If the caller asks for someone NOT on the list, politely explain that person is not available and offer to take a message.
+- When transferring, set "transfer_to" in the JSON summary to the exact name from the list above."""
+
+    now = datetime.datetime.now(tz=tz).strftime('%A, %d %B %Y at %H:%M %Z')
+
+    tenets_section = ""
+    if tenets:
+        rules = '\n'.join(f'{i+1}. {t}' for i, t in enumerate(tenets))
+        tenets_section = f"\nRules you must always follow:\n{rules}\n"
+
+    did_desc = did_numbers.get(extension.lstrip('+'), '') if extension else ''
+    did_line = f"This call was received on number: {extension}{f' ({did_desc})' if did_desc else ''}.\n" if extension else ""
+
+    caller_line = (
+        f"The caller's phone number is recognized as {known_caller_name}. "
+        f"You know who this is, but follow your rules about when to use their name.\n"
+        if known_caller_name else
+        "The caller is not in the contact list.\n"
+    )
+
     system_prompt = f"""You are an AI receptionist answering calls for {owner_name}.
-
+The current date and time is {now}.
+{did_line}{caller_line}
 {owner_name} is {availability}.
-
+{tenets_section}
 Your role:
 1. Greet the caller warmly and professionally
-2. Answer basic questions about {owner_name}'s availability
-3. Take detailed messages when appropriate
-4. Detect if the call is URGENT (emergency, time-sensitive, crisis)
-5. Keep responses concise (1-3 sentences) since this is a phone call
-
-Caller information:
-- Phone number: {caller_id}
-- Name: {display_name}
-- Known contact: {'Yes' if known_caller_name else 'No'}
-
+2. Ask who they would like to speak with or how you can help
+3. Answer basic questions about {owner_name}'s availability
+4. Take detailed messages when appropriate
+5. Detect if the call is URGENT (emergency, time-sensitive, crisis)
+6. Keep responses concise (1-3 sentences) since this is a phone call
+{transfer_section}
 At the end of the conversation, provide a JSON summary in this exact format on the last line:
-{{"summary": "Brief summary", "message": "Detailed message if any", "urgent": true/false}}
+{{"summary": "Brief summary", "message": "Detailed message if any", "urgent": false, "transfer_to": ""}}
 
+Set "transfer_to" to the person's name if transferring, otherwise leave it as an empty string.
 Keep your spoken responses natural and brief. The JSON summary only appears when you say goodbye."""
 
     conversation = []
@@ -353,7 +466,7 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
     max_turns = 8
 
     # Generate initial greeting
-    greeting_prompt = f"Generate a brief, warm greeting for {'known contact ' + known_caller_name if known_caller_name else 'an unknown caller'}. Just the greeting, no JSON yet."
+    greeting_prompt = "Generate a brief, warm professional greeting. Do not address the caller by name. Ask how you can help or who they would like to speak with. Just the greeting, no JSON yet."
     greeting = claude_respond(
         [{'role': 'user', 'content': greeting_prompt}],
         system_prompt,
@@ -365,7 +478,7 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
         greeting = f"Hello, you've reached {owner_name}'s home. How can I help you today?"
 
     agi.verbose(f'Greeting: {greeting}')
-    tts_speak(agi, greeting, ha_url, ha_token)
+    tts_speak(agi, greeting, ha_url, ha_token, tts_voice)
     transcript.append({'role': 'assistant', 'content': greeting})
     conversation.append({'role': 'assistant', 'content': greeting})
 
@@ -390,7 +503,7 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
         # Check if file has meaningful audio (> 1KB)
         if os.path.getsize(wav_path) < 1024:
             os.unlink(wav_path)
-            tts_speak(agi, "I'm sorry, I didn't catch that. Could you please repeat?", ha_url, ha_token)
+            tts_speak(agi, "I'm sorry, I didn't catch that. Could you please repeat?", ha_url, ha_token, tts_voice)
             continue
 
         # Convert to 16kHz for better STT accuracy
@@ -410,7 +523,7 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
             pass
 
         if not caller_text:
-            tts_speak(agi, "I'm sorry, I had trouble hearing you. Could you repeat that?", ha_url, ha_token)
+            tts_speak(agi, "I'm sorry, I had trouble hearing you. Could you repeat that?", ha_url, ha_token, tts_voice)
             continue
 
         agi.verbose(f"Caller said: {caller_text}")
@@ -438,7 +551,7 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
                         break
                     except Exception:
                         continue
-                tts_speak(agi, spoken or "Thank you for calling. Goodbye!", ha_url, ha_token)
+                tts_speak(agi, spoken or "Thank you for calling. Goodbye!", ha_url, ha_token, tts_voice)
                 transcript.append({'role': 'assistant', 'content': spoken})
             break
 
@@ -447,7 +560,7 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
         open("/tmp/debug.log", "a").write(f"Claude response: {repr(response)}\n")
 
         if not response:
-            tts_speak(agi, "I'm sorry, I'm having some trouble. Please try calling back.", ha_url, ha_token)
+            tts_speak(agi, "I'm sorry, I'm having some trouble. Please try calling back.", ha_url, ha_token, tts_voice)
             break
 
         # Check if response contains JSON summary (end of conversation)
@@ -463,7 +576,7 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
 
         agi.verbose(f"Response: {spoken_response}")
         call_log(unique_id, "AI", spoken_response)
-        tts_speak(agi, spoken_response, ha_url, ha_token)
+        tts_speak(agi, spoken_response, ha_url, ha_token, tts_voice)
         transcript.append({'role': 'assistant', 'content': spoken_response})
         conversation.append({'role': 'assistant', 'content': response})
 
@@ -484,22 +597,43 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
     summary_text = summary_data.get('summary', 'Call received')
 
     notification_title = f'{"🚨 URGENT " if urgent else "📞 "}Call from {display_name} ({caller_id})'
-    notification_body = summary_text
+
+    # Push notification body — summary + message so it's readable without opening HA
+    push_body = summary_text
     if message_text:
-        notification_body += f'\n\nMessage: {message_text}'
-    notification_body += f'\n\nTranscript: {transcript_file}'
+        push_body += f'\n\nMessage: {message_text}'
 
-    ha_notify(ha_url, ha_token, notification_title, notification_body, critical=urgent)
+    # Persistent notification body — full transcript
+    persistent_body = push_body
+    for turn in transcript:
+        persistent_body += f'\n\n**{turn["role"].upper()}:** {turn["content"]}'
 
-    # Fire ended event
-    ha_event(ha_url, ha_token, 'voip_call_ended', {
-        **call_info,
-        'summary': summary_text,
-        'urgent': urgent,
-        'transcript_file': transcript_file,
-    })
+    ha_persistent_notification(
+        ha_url, ha_token,
+        notification_title,
+        persistent_body,
+        notification_id=f'voip_call_{unique_id}',
+    )
+    ha_notify(ha_url, ha_token, notification_title, push_body, critical=urgent)
 
-    agi.hangup()
+    # Execute transfer if requested
+    transfer_name = summary_data.get('transfer_to', '').strip().lower()
+    transfer_target = transferable.get(transfer_name)
+    if transfer_target and transfer_target['dial']:
+        ha_event(ha_url, ha_token, 'voip_call_transferred', {
+            **call_info,
+            'transfer_to': transfer_target['name'],
+        })
+        agi._send(f"EXEC Dial {transfer_target['dial']}")
+    else:
+        # Fire ended event only when not transferring (Dial handles its own hangup)
+        ha_event(ha_url, ha_token, 'voip_call_ended', {
+            **call_info,
+            'summary': summary_text,
+            'urgent': urgent,
+            'transcript_file': transcript_file,
+        })
+        agi.hangup()
 
 
 if __name__ == '__main__':
