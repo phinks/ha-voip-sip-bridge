@@ -41,6 +41,7 @@ TENETS=$(python3 -c "import json; d=json.load(open('$OPTIONS')); print(json.dump
 TIMEZONE=$(get_opt timezone)
 TTS_VOICE=$(get_opt tts_voice)
 TRANSFERABLE_PEOPLE=$(python3 -c "import json; d=json.load(open('$OPTIONS')); print(json.dumps(d.get('transferable_people', [])))")
+PEOPLE=$(python3 -c "import json; d=json.load(open('$OPTIONS')); print(json.dumps(d.get('people', [])))")
 AUTO_ANSWER=$(get_opt_bool auto_answer)
 PLAY_GREETING=$(get_opt_bool play_greeting)
 GREETING_TEXT=$(get_opt greeting_text)
@@ -71,7 +72,7 @@ export VOIP_USER VOIP_PASS VOIP_DOMAIN VOIP_PROXY VOIP_PORT VOIP_TRANSPORT
 export VOIP_ENCRYPTION VOIP_CODECS VOIP_DID HA_URL HA_TOKEN
 export AUTO_ANSWER PLAY_GREETING GREETING_TEXT RECORD_CALLS AMI_SECRET
 export EXTERNAL_IP
-export ANTHROPIC_API_KEY GROQ_API_KEY OWNER_NAME AVAILABILITY_INFO AI_RECEPTIONIST DID_NUMBERS TENETS TIMEZONE TTS_VOICE TRANSFERABLE_PEOPLE
+export ANTHROPIC_API_KEY GROQ_API_KEY OWNER_NAME AVAILABILITY_INFO AI_RECEPTIONIST DID_NUMBERS TENETS TIMEZONE TTS_VOICE TRANSFERABLE_PEOPLE PEOPLE
 
 # ---------------------------------------------------------------------------
 # Generate dynamic Asterisk configs into /tmp/voip/
@@ -208,7 +209,8 @@ asterisk -rx "pjsip show registrations" 2>&1 || true
 # Install AGI handler
 # ---------------------------------------------------------------------------
 cp /opt/bridge/agi_handler.py /var/lib/asterisk/agi-bin/agi_handler.py 2>/dev/null || true
-chmod +x /var/lib/asterisk/agi-bin/agi_handler.py 2>/dev/null || true
+cp /opt/bridge/ai_receptionist.py /var/lib/asterisk/agi-bin/ai_receptionist.py 2>/dev/null || true
+chmod +x /var/lib/asterisk/agi-bin/agi_handler.py /var/lib/asterisk/agi-bin/ai_receptionist.py 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Start AMI monitor and command API
@@ -230,6 +232,10 @@ python3 /opt/bridge/command_api.py \
     --api-port 8089 &
 API_PID=$!
 
+echo "Starting status server on port 8099..."
+python3 /opt/bridge/status_server.py &
+STATUS_PID=$!
+
 echo "VoIP SIP Bridge is running."
 
 # ---------------------------------------------------------------------------
@@ -250,6 +256,11 @@ while true; do
             --ami-host 127.0.0.1 --ami-port 5038 --ami-secret "$AMI_SECRET" \
             --api-port 8089 &
         API_PID=$!
+    fi
+    if ! kill -0 "$STATUS_PID" 2>/dev/null; then
+        echo "Status server died - restarting..."
+        python3 /opt/bridge/status_server.py &
+        STATUS_PID=$!
     fi
     if ! kill -0 "$ASTERISK_PID" 2>/dev/null; then
         echo "FATAL: Asterisk exited - shutting down."

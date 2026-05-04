@@ -21,7 +21,12 @@ import subprocess
 import tempfile
 import requests
 import datetime
+import signal
 from zoneinfo import ZoneInfo
+
+# Prevent SIGPIPE/SIGHUP from killing the process when the AGI channel hangs up mid-response
+signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
 def call_log(unique_id, role, text):
     """Append to conversation log file."""
@@ -51,9 +56,12 @@ class AGI:
                 self.env[key.strip()] = value.strip()
 
     def _send(self, cmd):
-        sys.stdout.write(cmd + '\n')
-        sys.stdout.flush()
-        return sys.stdin.readline().strip()
+        try:
+            sys.stdout.write(cmd + '\n')
+            sys.stdout.flush()
+            return sys.stdin.readline().strip()
+        except Exception:
+            return ''
 
     def _result(self, resp):
         try:
@@ -132,6 +140,14 @@ def claude_respond(messages, system_prompt, api_key, max_tokens=300):
     return None
 
 
+def tts_log(msg):
+    try:
+        with open("/share/voip/tts_debug.log", "a") as f:
+            f.write(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
 def tts_speak(agi, text, ha_url, ha_token, voice="en-US-JennyNeural", tmp_dir="/tmp/voip_tts"):
     """Convert text to speech using HA Cloud TTS."""
     import os
@@ -140,7 +156,7 @@ def tts_speak(agi, text, ha_url, ha_token, voice="en-US-JennyNeural", tmp_dir="/
     asterisk_file = wav_file.replace(".wav", "")
     try:
         resp = requests.post(
-            f"{ha_url.rstrip("/")}/api/tts_get_url",
+            f"{ha_url.rstrip('/')}/api/tts_get_url",
             headers={
                 "Authorization": f"Bearer {ha_token}",
                 "Content-Type": "application/json",
@@ -153,35 +169,48 @@ def tts_speak(agi, text, ha_url, ha_token, voice="en-US-JennyNeural", tmp_dir="/
             },
             timeout=10,
         )
+        tts_log(f"TTS request status: {resp.status_code}, body: {resp.text[:200]}")
         if resp.status_code == 200:
             audio_url = resp.json().get("url", "")
+            tts_log(f"Audio URL: {audio_url}")
             if audio_url:
-                # Download the audio
                 audio_resp = requests.get(audio_url, timeout=10)
+                tts_log(f"Audio download status: {audio_resp.status_code}, size: {len(audio_resp.content)}")
                 mp3_file = wav_file.replace(".wav", ".mp3")
                 with open(mp3_file, "wb") as f:
                     f.write(audio_resp.content)
-                # Convert to 8kHz mono WAV for Asterisk
-                subprocess.run(["ffmpeg", "-i", mp3_file, "-ar", "8000", "-ac", "1", wav_file, "-y"], stderr=subprocess.DEVNULL)
-                os.unlink(mp3_file)
+                result = subprocess.run(
+                    ["ffmpeg", "-i", mp3_file, "-ar", "8000", "-ac", "1", wav_file, "-y"],
+                    capture_output=True, text=True
+                )
+                tts_log(f"ffmpeg exit={result.returncode}, stderr={result.stderr[-200:] if result.stderr else ''}")
+                try: os.unlink(mp3_file)
+                except: pass
     except Exception as e:
+        tts_log(f"HA TTS exception: {e}")
         agi.verbose(f"HA TTS failed: {e}")
     # Fallback to espeak
     if not os.path.exists(wav_file):
+        tts_log("Falling back to espeak")
         espeak_wav = wav_file.replace(".wav", "_espeak.wav")
-        subprocess.run([
-            "espeak", "-a", "150", "-s", "130", "-v", "en", text,
-            "--stdout"
-        ], stdout=open(espeak_wav, "wb"), stderr=subprocess.DEVNULL)
-        subprocess.run([
-            "sox", espeak_wav, "-r", "8000", "-c", "1", wav_file
-        ], stderr=subprocess.DEVNULL)
+        r1 = subprocess.run(
+            ["espeak", "-a", "150", "-s", "130", "-v", "en", text, "--stdout"],
+            stdout=open(espeak_wav, "wb"), capture_output=False, stderr=subprocess.PIPE
+        )
+        r2 = subprocess.run(
+            ["sox", espeak_wav, "-r", "8000", "-c", "1", wav_file],
+            capture_output=True, text=True
+        )
+        tts_log(f"espeak exit={r1.returncode}, sox exit={r2.returncode}, sox stderr={r2.stderr[:200]}")
         try: os.unlink(espeak_wav)
         except: pass
     if os.path.exists(wav_file):
+        tts_log(f"Playing {wav_file}")
         agi.playback(asterisk_file)
         try: os.unlink(wav_file)
         except: pass
+    else:
+        tts_log(f"ERROR: wav file not created, playback skipped")
 
 
 def stt_transcribe(wav_file, groq_api_key):
@@ -228,7 +257,7 @@ def ha_persistent_notification(ha_url, ha_token, title, message, notification_id
 def ha_notify(ha_url, ha_token, title, message, critical=False):
     """Fire a HA mobile notification."""
     try:
-        data = {'url': '/'}
+        data = {'url': '/notifications'}
         if critical:
             data['push'] = {
                 'sound': {
@@ -270,6 +299,91 @@ def ha_event(ha_url, ha_token, event_name, data):
         pass
 
 
+def get_ha_state(ha_url, ha_token, entity_id):
+    try:
+        resp = requests.get(
+            f'{ha_url.rstrip("/")}/api/states/{entity_id}',
+            headers={'Authorization': f'Bearer {ha_token}'},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+
+def get_calendar_events(ha_url, ha_token, calendar_entity, tz):
+    try:
+        now = datetime.datetime.now(tz=tz)
+        end = now + datetime.timedelta(hours=24)
+        resp = requests.get(
+            f'{ha_url.rstrip("/")}/api/calendars/{calendar_entity}',
+            headers={'Authorization': f'Bearer {ha_token}'},
+            params={'start': now.isoformat(), 'end': end.isoformat()},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return []
+
+
+def build_people_context(ha_url, ha_token, people, tz):
+    lines = []
+    for p in people:
+        name = p.get('name', '')
+        title = p.get('title', '')
+        display = f"{title} ({name})" if title else name
+
+        presence = ''
+        ha_person = p.get('ha_person', '')
+        if ha_person:
+            state = get_ha_state(ha_url, ha_token, ha_person)
+            if state:
+                s = state.get('state', 'unknown')
+                if s == 'home':
+                    presence = 'HOME'
+                elif s in ('not_home', 'away'):
+                    presence = 'AWAY'
+                else:
+                    presence = s.upper()
+
+        cal_parts = []
+        calendar = p.get('calendar', '')
+        if calendar:
+            events = get_calendar_events(ha_url, ha_token, calendar, tz)
+            for ev in events[:4]:
+                summary = ev.get('summary', 'event')
+                start = ev.get('start', {})
+                dt_str = start.get('dateTime', start.get('date', ''))
+                if dt_str:
+                    try:
+                        dt = datetime.datetime.fromisoformat(dt_str)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=datetime.timezone.utc).astimezone(tz)
+                        else:
+                            dt = dt.astimezone(tz)
+                        time_str = dt.strftime('%-I:%M %p')
+                    except Exception:
+                        time_str = dt_str
+                    cal_parts.append(f"{summary} at {time_str}")
+                else:
+                    cal_parts.append(summary)
+
+        parts = [display]
+        if presence:
+            parts.append(presence)
+        if cal_parts:
+            parts.append('today: ' + ', '.join(cal_parts))
+        elif calendar:
+            parts.append('no calendar events today')
+        lines.append(' — '.join(parts))
+
+    return '\n'.join(f'  • {l}' for l in lines)
+
+
 def auto_capture_did(extension):
     """Record an unseen DID to /share/voip/known_dids.json. Returns True if it was new."""
     if not extension:
@@ -295,11 +409,13 @@ def auto_capture_did(extension):
 # Save transcript
 # ---------------------------------------------------------------------------
 
-def save_transcript(caller_id, caller_name, transcript, summary, urgent, unique_id):
+def save_transcript(caller_id, caller_name, transcript, summary, urgent, unique_id, call_ts=None):
     """Save call transcript to /share/voip/transcripts/."""
     os.makedirs('/share/voip/transcripts', exist_ok=True)
-    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f'/share/voip/transcripts/{ts}_{caller_id}.txt'
+    if call_ts is None:
+        call_ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    safe_cid = re.sub(r'[^0-9A-Za-z+]', '_', caller_id)
+    filename = f'/share/voip/transcripts/{call_ts}_{safe_cid}.txt'
     with open(filename, 'w') as f:
         f.write(f'Date: {datetime.datetime.now().isoformat()}\n')
         f.write(f'Caller ID: {caller_id}\n')
@@ -334,6 +450,8 @@ def main():
     if len(sys.argv) >= 5:
         extension = sys.argv[4] or extension
 
+    call_ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+
     # Config from environment
     ha_url      = os.environ.get('HA_URL', 'http://homeassistant:8123')
     ha_token    = os.environ.get('HA_TOKEN', '')
@@ -343,6 +461,7 @@ def main():
     availability = os.environ.get('AVAILABILITY_INFO', 'often unavailable')
     tts_voice   = os.environ.get('TTS_VOICE', 'en-US-JennyNeural')
     tz          = ZoneInfo(os.environ.get('TIMEZONE', 'UTC') or 'UTC')
+    record_calls = os.environ.get('RECORD_CALLS', 'false').lower() == 'true'
 
     tenets = []
     try:
@@ -359,19 +478,43 @@ def main():
     except Exception:
         pass
 
-    # Parse transferable people: [{"name": "Paul", "extension": "PJSIP/paul", "phone": "SIP/voip/+1..."}]
-    transferable = {}  # lowercase name -> {"name": str, "dial": str}
-    try:
-        people_raw = json.loads(os.environ.get('TRANSFERABLE_PEOPLE', '[]'))
-        for p in people_raw:
+    # Parse people — file config takes precedence over env var
+    people = []
+    people_file = '/share/voip/people.json'
+    if os.path.exists(people_file):
+        try:
+            with open(people_file) as f:
+                people = json.load(f)
+        except Exception:
+            pass
+    if not people:
+        try:
+            people = json.loads(os.environ.get('PEOPLE', '[]'))
+        except Exception:
+            pass
+
+    # Build transferable dict from people (preferred) or legacy transferable_people
+    transferable = {}
+    if people:
+        for p in people:
             name = p.get('name', '').strip()
             if not name:
                 continue
             parts = [p.get('extension', '').strip(), p.get('phone', '').strip()]
             dial = '&'.join(x for x in parts if x)
-            transferable[name.lower()] = {'name': name, 'dial': dial}
-    except Exception:
-        pass
+            if dial:
+                transferable[name.lower()] = {'name': name, 'dial': dial}
+    else:
+        try:
+            for p in json.loads(os.environ.get('TRANSFERABLE_PEOPLE', '[]')):
+                name = p.get('name', '').strip()
+                if not name:
+                    continue
+                parts = [p.get('extension', '').strip(), p.get('phone', '').strip()]
+                dial = '&'.join(x for x in parts if x)
+                transferable[name.lower()] = {'name': name, 'dial': dial}
+        except Exception:
+            pass
 
     # Auto-capture unseen DIDs
     if extension and extension not in did_numbers:
@@ -415,17 +558,8 @@ def main():
     # Play immediate greeting while Claude prepares
     if os.path.exists("/share/voip/greeting"):
         agi.playback("/share/voip/greeting")
-    # Build system prompt
-    transfer_section = ""
-    if transferable:
-        names = ', '.join(p['name'] for p in transferable.values())
-        transfer_section = f"""
-People who can receive transferred calls: {names}
-- If the caller asks to speak with one of these people, confirm the name and offer to transfer them.
-- If the caller asks for someone NOT on the list, politely explain that person is not available and offer to take a message.
-- When transferring, set "transfer_to" in the JSON summary to the exact name from the list above."""
 
-    now = datetime.datetime.now(tz=tz).strftime('%A, %d %B %Y at %H:%M %Z')
+    now_str = datetime.datetime.now(tz=tz).strftime('%A, %d %B %Y at %H:%M %Z')
 
     tenets_section = ""
     if tenets:
@@ -442,19 +576,47 @@ People who can receive transferred calls: {names}
         "The caller is not in the contact list.\n"
     )
 
-    system_prompt = f"""You are an AI receptionist answering calls for {owner_name}.
-The current date and time is {now}.
+    # Build household / availability section
+    if people:
+        owners = [p['name'] for p in people if p.get('owner')]
+        household_name = ' and '.join(owners) if owners else (people[0]['name'] if people else owner_name)
+        people_ctx = build_people_context(ha_url, ha_token, people, tz)
+        availability_section = f"Household members and their current status:\n{people_ctx}"
+    else:
+        household_name = owner_name
+        availability_section = f"{owner_name} is {availability}."
+
+    transfer_section = ""
+    if transferable:
+        names = ', '.join(p['name'] for p in transferable.values())
+        transfer_section = f"""
+People who can receive transferred calls: {names}
+- If the caller asks to speak with one of these people, confirm the name and offer to transfer them.
+- If the caller asks for someone NOT on the list, politely explain that person is not available and offer to take a message.
+- When transferring, set "transfer_to" in the JSON summary to the exact name from the list above."""
+
+    system_prompt = f"""You are an AI receptionist answering calls for {household_name}.
+The current date and time is {now_str}.
 {did_line}{caller_line}
-{owner_name} is {availability}.
+{availability_section}
 {tenets_section}
 Your role:
 1. Greet the caller warmly and professionally
 2. Ask who they would like to speak with or how you can help
-3. Answer basic questions about {owner_name}'s availability
+3. Use the household member status above to give accurate availability information
 4. Take detailed messages when appropriate
 5. Detect if the call is URGENT (emergency, time-sensitive, crisis)
 6. Keep responses concise (1-3 sentences) since this is a phone call
 {transfer_section}
+ROBOCALL HANDLING:
+If the caller appears to be a robocall or scam (automated voice, asks to press a digit, offers prizes, claims to be from government/IRS/Microsoft, warns of account suspension, etc.), play along to waste their time as long as possible.
+- On the FIRST turn you identify it as a robocall, prefix your entire response with [ROBOCALL] (e.g. "[ROBOCALL] Oh wonderful!..."). Only use this prefix once.
+- If they ask you to press a digit (e.g. "press 2 for details"), start your response with [DTMF:X] (where X is the digit) — this sends the keypress automatically. If also the first robocall turn, use [ROBOCALL][DTMF:X].
+- Then engage enthusiastically but slowly. Ask lots of clarifying questions. Pretend to be confused. Fumble for details.
+- If they ask for personal information, give plausible but completely fake details: name "Gerald Hutchinson", address "742 Evergreen Terrace, Springfield", date of birth "March 15, 1947", card number "4111 1111 1111 1111", expiry "12/26", CVV "999", Social Security "078-05-1120".
+- Never give real information. Drag the call out as long as possible.
+- Only end when they hang up or after many turns.
+
 At the end of the conversation, provide a JSON summary in this exact format on the last line:
 {{"summary": "Brief summary", "message": "Detailed message if any", "urgent": false, "transfer_to": ""}}
 
@@ -463,7 +625,7 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
 
     conversation = []
     transcript = []
-    max_turns = 8
+    max_turns = 20
 
     # Generate initial greeting
     greeting_prompt = "Generate a brief, warm professional greeting. Do not address the caller by name. Ask how you can help or who they would like to speak with. Just the greeting, no JSON yet."
@@ -477,6 +639,14 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
     if not greeting:
         greeting = f"Hello, you've reached {owner_name}'s home. How can I help you today?"
 
+    # Start recording before greeting so the full call is captured
+    if record_calls:
+        os.makedirs('/share/voip/recordings', exist_ok=True)
+        safe_cid = re.sub(r'[^0-9A-Za-z+]', '_', caller_id)
+        rec_path = f'/share/voip/recordings/{call_ts}_{safe_cid}.wav'
+        resp = agi._send(f'EXEC MixMonitor {rec_path}')
+        agi.verbose(f'Recording to {rec_path} (MixMonitor resp: {resp})')
+
     agi.verbose(f'Greeting: {greeting}')
     tts_speak(agi, greeting, ha_url, ha_token, tts_voice)
     transcript.append({'role': 'assistant', 'content': greeting})
@@ -486,14 +656,13 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
     ha_event(ha_url, ha_token, 'voip_call_answered', call_info)
 
     # Conversation loop
-    summary_data = {'summary': 'Call received', 'message': '', 'urgent': False}
-
+    robocall_detected = False
     for turn in range(max_turns):
-        # Record caller speech
+        # Record caller speech — use longer silence timeout for robocalls so full prompts are captured
         rec_file = f"/var/spool/asterisk/recording/voip_rec_{unique_id}_{turn}"
         agi.verbose(f'Recording turn {turn}...')
-        result = agi.record_file(rec_file, fmt="wav", timeout=8000, silence=2)
-        open("/tmp/debug.log", "a").write(f"Turn {turn}: result={result}, file={rec_file}.wav, exists={os.path.exists(rec_file + ".wav")}\n")
+        result = agi.record_file(rec_file, fmt="wav", timeout=8000, silence=4 if robocall_detected else 2)
+        open("/tmp/debug.log", "a").write(f"Turn {turn}: result={result}, file={rec_file}.wav, exists={os.path.exists(rec_file + '.wav')}\n")
         agi.verbose(f"Record result: {result}, checking: {rec_file}.wav")
 
         wav_path = f'{rec_file}.wav'
@@ -574,6 +743,20 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
             except Exception:
                 continue
 
+        # Check for robocall detection signal
+        if spoken_response.startswith('[ROBOCALL]'):
+            robocall_detected = True
+            spoken_response = spoken_response[len('[ROBOCALL]'):].lstrip()
+            agi.verbose('Robocall detected — switching to extended silence timeout')
+
+        # Check for DTMF instruction and send the tone before speaking
+        dtmf_match = re.match(r'^\[DTMF:([0-9*#]+)\]\s*', spoken_response)
+        if dtmf_match:
+            digit = dtmf_match.group(1)
+            spoken_response = spoken_response[dtmf_match.end():]
+            agi._send(f"EXEC SendDTMF {digit}")
+            call_log(unique_id, "DTMF", digit)
+
         agi.verbose(f"Response: {spoken_response}")
         call_log(unique_id, "AI", spoken_response)
         tts_speak(agi, spoken_response, ha_url, ha_token, tts_voice)
@@ -588,7 +771,7 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
     transcript_file = save_transcript(
         caller_id, caller_name or known_caller_name,
         transcript, summary_data.get('summary', ''),
-        summary_data.get('urgent', False), unique_id
+        summary_data.get('urgent', False), unique_id, call_ts
     )
 
     # Send HA notification
@@ -626,6 +809,9 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
         })
         agi._send(f"EXEC Dial {transfer_target['dial']}")
     else:
+        # Stop MixMonitor explicitly so the WAV header is finalised before the channel closes
+        if record_calls:
+            agi._send('EXEC StopMixMonitor')
         # Fire ended event only when not transferring (Dial handles its own hangup)
         ha_event(ha_url, ha_token, 'voip_call_ended', {
             **call_info,
