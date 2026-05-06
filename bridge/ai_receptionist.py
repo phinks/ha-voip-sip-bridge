@@ -254,10 +254,26 @@ def ha_persistent_notification(ha_url, ha_token, title, message, notification_id
         pass
 
 
+def get_ingress_url():
+    try:
+        supervisor_token = os.environ.get('SUPERVISOR_TOKEN', '')
+        if not supervisor_token:
+            return ''
+        resp = requests.get(
+            'http://supervisor/addons/self/info',
+            headers={'Authorization': f'Bearer {supervisor_token}'},
+            timeout=5,
+        )
+        return resp.json().get('data', {}).get('ingress_url', '')
+    except Exception:
+        return ''
+
+
 def ha_notify(ha_url, ha_token, title, message, critical=False):
     """Fire a HA mobile notification."""
     try:
-        data = {'url': '/notifications'}
+        ingress_url = get_ingress_url()
+        data = {'url': ingress_url or '/config'}
         if critical:
             data['push'] = {
                 'sound': {
@@ -611,7 +627,7 @@ Your role:
 ROBOCALL HANDLING:
 If the caller appears to be a robocall or scam (automated voice, asks to press a digit, offers prizes, claims to be from government/IRS/Microsoft, warns of account suspension, etc.), play along to waste their time as long as possible.
 - On the FIRST turn you identify it as a robocall, prefix your entire response with [ROBOCALL] (e.g. "[ROBOCALL] Oh wonderful!..."). Only use this prefix once.
-- If they ask you to press a digit (e.g. "press 2 for details"), start your response with [DTMF:X] (where X is the digit) — this sends the keypress automatically. If also the first robocall turn, use [ROBOCALL][DTMF:X].
+- If they ask you to press a digit (e.g. "press 2 for details"), you MUST start your response with [DTMF:X] (where X is the digit) — this sends the actual keypress. NEVER just say you pressed it without the prefix; without [DTMF:X] the keypress is never sent. If also the first robocall turn, use [ROBOCALL][DTMF:X]. ALWAYS press the option that connects you to an agent or hears more details. NEVER press an option described as "remove", "opt out", "stop calls", or "do not call" — that ends the call.
 - Then engage enthusiastically but slowly. Ask lots of clarifying questions. Pretend to be confused. Fumble for details.
 - If they ask for personal information, give plausible but completely fake details: name "Gerald Hutchinson", address "742 Evergreen Terrace, Springfield", date of birth "March 15, 1947", card number "4111 1111 1111 1111", expiry "12/26", CVV "999", Social Security "078-05-1120".
 - Never give real information. Drag the call out as long as possible.
@@ -639,29 +655,59 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
     if not greeting:
         greeting = f"Hello, you've reached {owner_name}'s home. How can I help you today?"
 
-    # Start recording before greeting so the full call is captured
-    if record_calls:
-        os.makedirs('/share/voip/recordings', exist_ok=True)
-        safe_cid = re.sub(r'[^0-9A-Za-z+]', '_', caller_id)
-        rec_path = f'/share/voip/recordings/{call_ts}_{safe_cid}.wav'
-        resp = agi._send(f'EXEC MixMonitor {rec_path}')
-        agi.verbose(f'Recording to {rec_path} (MixMonitor resp: {resp})')
+    safe_cid = re.sub(r'[^0-9A-Za-z+]', '_', caller_id)
+
+    # Record incoming channel while greeting plays so we can detect robocall "press X" prompts.
+    # Robocalls start their script when they hear our voice, so "press 2 for more information"
+    # is typically spoken during our greeting — we'd never hear it in the normal listen loop.
+    _pre_recv = f'/var/spool/asterisk/recording/pre_recv_{unique_id}.wav'
+    _pre_mix  = f'/tmp/pre_mix_{unique_id}.wav'
+    agi._send(f'EXEC MixMonitor {_pre_mix},r({_pre_recv})')
 
     agi.verbose(f'Greeting: {greeting}')
     tts_speak(agi, greeting, ha_url, ha_token, tts_voice)
     transcript.append({'role': 'assistant', 'content': greeting})
     conversation.append({'role': 'assistant', 'content': greeting})
 
+    # Stop pre-greeting recording and check for a DTMF prompt
+    agi._send('EXEC StopMixMonitor')
+    for _f in [_pre_mix]:
+        try: os.unlink(_f)
+        except: pass
+    if os.path.exists(_pre_recv) and os.path.getsize(_pre_recv) > 512:
+        _pre_text = stt_transcribe(_pre_recv, groq_key)
+        agi.verbose(f'Heard during greeting: {_pre_text}')
+        if _pre_text:
+            _wd = {'zero':'0','one':'1','two':'2','three':'3','four':'4',
+                   'five':'5','six':'6','seven':'7','eight':'8','nine':'9'}
+            _dm = re.search(r'press\s+([0-9]|zero|one|two|three|four|five|six|seven|eight|nine)', _pre_text, re.IGNORECASE)
+            if _dm:
+                _digit = _dm.group(1)
+                _digit = _wd.get(_digit.lower(), _digit)
+                agi._send(f'EXEC SendDTMF {_digit}')
+                agi.verbose(f'Pre-greeting DTMF {_digit} sent')
+                call_log(unique_id, 'PRE-DTMF', f'Pressed {_digit}: {_pre_text}')
+    try: os.unlink(_pre_recv)
+    except: pass
+
+    # Start call recording for the conversation
+    if record_calls:
+        os.makedirs('/share/voip/recordings', exist_ok=True)
+        rec_path = f'/share/voip/recordings/{call_ts}_{safe_cid}.wav'
+        resp = agi._send(f'EXEC MixMonitor {rec_path}')
+        agi.verbose(f'Recording to {rec_path} (MixMonitor resp: {resp})')
+
     # Fire answered event
     ha_event(ha_url, ha_token, 'voip_call_answered', call_info)
 
     # Conversation loop
+    summary_data = {'summary': 'Call received', 'message': '', 'urgent': False, 'transfer_to': ''}
     robocall_detected = False
     for turn in range(max_turns):
         # Record caller speech — use longer silence timeout for robocalls so full prompts are captured
         rec_file = f"/var/spool/asterisk/recording/voip_rec_{unique_id}_{turn}"
         agi.verbose(f'Recording turn {turn}...')
-        result = agi.record_file(rec_file, fmt="wav", timeout=8000, silence=4 if robocall_detected else 2)
+        result = agi.record_file(rec_file, fmt="wav", timeout=12000, silence=6 if robocall_detected else 3)
         open("/tmp/debug.log", "a").write(f"Turn {turn}: result={result}, file={rec_file}.wav, exists={os.path.exists(rec_file + '.wav')}\n")
         agi.verbose(f"Record result: {result}, checking: {rec_file}.wav")
 
@@ -699,6 +745,36 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
         call_log(unique_id, "CALLER", caller_text)
         transcript.append({'role': 'user', 'content': caller_text})
         conversation.append({'role': 'user', 'content': caller_text})
+
+        # Auto-send DTMF if caller says "press N", preferring engage options over opt-out
+        _word_digits = {'zero':'0','one':'1','two':'2','three':'3','four':'4',
+                        'five':'5','six':'6','seven':'7','eight':'8','nine':'9'}
+        _opt_out_re = re.compile(r'\b(remove|opt.?out|stop|unsubscribe|no.?call|do not call)\b', re.IGNORECASE)
+        _press_re = re.compile(r'press\s+([0-9]|zero|one|two|three|four|five|six|seven|eight|nine)', re.IGNORECASE)
+        _all_press = list(_press_re.finditer(caller_text))
+        if _all_press:
+            # Prefer the first match that isn't followed by opt-out language
+            _chosen = next(
+                (m for m in _all_press if not _opt_out_re.search(caller_text[m.start():m.start()+60])),
+                _all_press[0]  # fall back to first if all are opt-out
+            )
+            _d = _chosen.group(1)
+            _d = _word_digits.get(_d.lower(), _d)
+            agi._send(f'EXEC SendDTMF {_d}')
+            call_log(unique_id, 'DTMF-AUTO', f'Auto-pressed {_d} from: {caller_text}')
+            agi.verbose(f'Auto-DTMF {_d} sent from caller speech')
+
+        # Detect robocall keywords early so silence timeout extends immediately next turn
+        if not robocall_detected:
+            _robo_kw = re.compile(
+                r'\b(press\s+\d|funds.?released|congratulations|account.?suspend|'
+                r'IRS|Medicare|warranty|you.?have.?been.?selected|claim.?your|'
+                r'Social.?Security|vehicle|extended.?coverage)\b',
+                re.IGNORECASE
+            )
+            if _robo_kw.search(caller_text):
+                robocall_detected = True
+                agi.verbose('Robocall keywords detected — extending silence timeout')
 
         # Check for goodbye
         goodbye_words = ['goodbye', 'bye', 'thanks bye', 'thank you goodbye', 'that\'s all']
