@@ -764,6 +764,32 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
             call_log(unique_id, 'DTMF-AUTO', f'Auto-pressed {_d} from: {caller_text}')
             agi.verbose(f'Auto-DTMF {_d} sent from caller speech')
 
+            # Listen briefly for any immediate follow-up DTMF prompt (robocalls often chain them)
+            _follow_file = f'/var/spool/asterisk/recording/voip_follow_{unique_id}_{turn}'
+            agi.record_file(_follow_file, fmt='wav', timeout=4000, silence=2)
+            _follow_wav = _follow_file + '.wav'
+            if os.path.exists(_follow_wav) and os.path.getsize(_follow_wav) > 1024:
+                _follow_16k = _follow_file + '_16k.wav'
+                subprocess.run(['ffmpeg', '-i', _follow_wav, '-ar', '16000', '-ac', '1', _follow_16k, '-y'], stderr=subprocess.DEVNULL)
+                _follow_text = stt_transcribe(_follow_16k if os.path.exists(_follow_16k) else _follow_wav, groq_key)
+                agi.verbose(f'Follow-up STT: {_follow_text}')
+                _follow_presses = list(_press_re.finditer(_follow_text))
+                if _follow_presses:
+                    _follow_chosen = next(
+                        (m for m in _follow_presses if not _opt_out_re.search(_follow_text[m.start():m.start()+60])),
+                        _follow_presses[0]
+                    )
+                    _fd = _follow_chosen.group(1)
+                    _fd = _word_digits.get(_fd.lower(), _fd)
+                    agi._send(f'EXEC SendDTMF {_fd}')
+                    call_log(unique_id, 'DTMF-FOLLOW', f'Follow-up pressed {_fd} from: {_follow_text}')
+                    agi.verbose(f'Follow-up DTMF {_fd} sent')
+                    # Append follow-up to caller_text so Claude has full context
+                    caller_text = caller_text + ' ' + _follow_text
+                for f in [_follow_wav, _follow_16k if os.path.exists(_follow_16k) else '']:
+                    try: os.unlink(f)
+                    except: pass
+
         # Detect robocall keywords early so silence timeout extends immediately next turn
         if not robocall_detected:
             _robo_kw = re.compile(
