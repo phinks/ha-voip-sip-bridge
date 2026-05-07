@@ -703,6 +703,10 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
     # Conversation loop
     summary_data = {'summary': 'Call received', 'message': '', 'urgent': False, 'transfer_to': ''}
     robocall_detected = False
+    _word_digits = {'zero':'0','one':'1','two':'2','three':'3','four':'4',
+                    'five':'5','six':'6','seven':'7','eight':'8','nine':'9'}
+    _opt_out_re = re.compile(r'\b(remove|opt.?out|stop|unsubscribe|no.?call|do not call)\b', re.IGNORECASE)
+    _press_re = re.compile(r'press\s+([0-9]|zero|one|two|three|four|five|six|seven|eight|nine)', re.IGNORECASE)
     for turn in range(max_turns):
         # Record caller speech — use longer silence timeout for robocalls so full prompts are captured
         rec_file = f"/var/spool/asterisk/recording/voip_rec_{unique_id}_{turn}"
@@ -747,10 +751,6 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
         conversation.append({'role': 'user', 'content': caller_text})
 
         # Auto-send DTMF if caller says "press N", preferring engage options over opt-out
-        _word_digits = {'zero':'0','one':'1','two':'2','three':'3','four':'4',
-                        'five':'5','six':'6','seven':'7','eight':'8','nine':'9'}
-        _opt_out_re = re.compile(r'\b(remove|opt.?out|stop|unsubscribe|no.?call|do not call)\b', re.IGNORECASE)
-        _press_re = re.compile(r'press\s+([0-9]|zero|one|two|three|four|five|six|seven|eight|nine)', re.IGNORECASE)
         _all_press = list(_press_re.finditer(caller_text))
         if _all_press:
             # Prefer the first match that isn't followed by opt-out language
@@ -861,7 +861,39 @@ Keep your spoken responses natural and brief. The JSON summary only appears when
 
         agi.verbose(f"Response: {spoken_response}")
         call_log(unique_id, "AI", spoken_response)
+
+        # Start a background MixMonitor (caller audio only) while TTS plays,
+        # so we catch any DTMF prompts the robocall sends during our speech.
+        _bg_id = f'bg_{unique_id}_{turn}'
+        _bg_wav = f'/tmp/voip_bg_{unique_id}_{turn}.wav'
+        agi._send(f'EXEC MixMonitor {_bg_wav},ri({_bg_id})')
+
         tts_speak(agi, spoken_response, ha_url, ha_token, tts_voice)
+
+        # Stop just our background recording (leaves call recording untouched)
+        agi._send(f'EXEC StopMixMonitor {_bg_id}')
+
+        # Process whatever the caller said while we were speaking
+        if os.path.exists(_bg_wav) and os.path.getsize(_bg_wav) > 1024:
+            _bg_16k = _bg_wav.replace('.wav', '_16k.wav')
+            subprocess.run(['ffmpeg', '-i', _bg_wav, '-ar', '16000', '-ac', '1', _bg_16k, '-y'], stderr=subprocess.DEVNULL)
+            _bg_text = stt_transcribe(_bg_16k if os.path.exists(_bg_16k) else _bg_wav, groq_key)
+            agi.verbose(f'Background (during speech) STT: {_bg_text}')
+            _bg_presses = list(_press_re.finditer(_bg_text))
+            if _bg_presses:
+                _bg_chosen = next(
+                    (m for m in _bg_presses if not _opt_out_re.search(_bg_text[m.start():m.start()+60])),
+                    _bg_presses[0]
+                )
+                _bd = _bg_chosen.group(1)
+                _bd = _word_digits.get(_bd.lower(), _bd)
+                agi._send(f'EXEC SendDTMF {_bd}')
+                call_log(unique_id, 'DTMF-BG', f'Pressed {_bd} from background audio: {_bg_text}')
+                agi.verbose(f'Background DTMF {_bd} sent')
+            for _f in [_bg_wav, _bg_16k]:
+                try: os.unlink(_f)
+                except: pass
+
         transcript.append({'role': 'assistant', 'content': spoken_response})
         conversation.append({'role': 'assistant', 'content': response})
 
